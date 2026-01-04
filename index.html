@@ -554,6 +554,7 @@ button { -webkit-user-select: none; user-select: none; }
 
     <div id="audioStatusWrap" class="mt-3 flex items-center gap-3 text-sm">
       <span class="font-semibold">Audio:</span>
+      <button id="enableAudioBtn" class="py-1.5 px-3 rounded bg-green-600 text-white hover:bg-green-500">Enable Audio</button>
       <span id="audioStatus" class="px-2 py-1 rounded bg-gray-800 text-gray-200">Not initialized</span>
       <button id="audioTestBtn" class="py-1.5 px-3 rounded bg-gray-700 hover:bg-gray-600 text-gray-100">Test Tone</button>
       <span class="text-gray-400">If silent on iPhone: disable Silent Mode and raise volume.</span>
@@ -1199,8 +1200,55 @@ button { -webkit-user-select: none; user-select: none; }
     // AUDIO SYSTEM (Web Audio API)
     // ============================================================================
     
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    // ======================
+    // WebAudio Unlock Module
+    // ======================
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+
     let audioCtx = null;
+    let __audioUnlockPromise = null;
+
+    async function ensureAudioContext() {
+      if (!AudioContextClass) return null;
+
+      if (!audioCtx) {
+        audioCtx = new AudioContextClass({ latencyHint: "interactive" });
+      }
+
+      // Critical: resume is async; iOS often starts suspended
+      if (audioCtx.state !== "running") {
+        try { await audioCtx.resume(); } catch (e) {}
+      }
+
+      // iOS unlock: play a silent 1-sample buffer once
+      if (audioCtx.state === "running" && !audioCtx.__unlocked) {
+        const buffer = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
+        const src = audioCtx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(audioCtx.destination);
+        src.start(0);
+        audioCtx.__unlocked = true;
+      }
+
+      // Optional UI status hook
+      const statusEl = document.getElementById("audioStatus");
+      if (statusEl) statusEl.textContent = `Audio: Ready (${audioCtx.state})`;
+
+      return audioCtx;
+    }
+
+    // Legacy compatibility for existing code that calls initAudioContext()
+    function initAudioContext() {
+      if (!__audioUnlockPromise) __audioUnlockPromise = ensureAudioContext();
+      return audioCtx;
+    }
+
+    // Pre-unlock on first gesture anywhere (mobile Safari best practice)
+    ["pointerdown","touchstart","mousedown","keydown"].forEach(evt => {
+      document.addEventListener(evt, () => {
+        if (!__audioUnlockPromise) __audioUnlockPromise = ensureAudioContext();
+      }, { once: true, passive: true });
+    });
 
     function showAudioError(message = 'Audio disabled - tap anywhere to enable sound.') {
       if (document.querySelector('.audio-error-toast')) return;
@@ -1211,31 +1259,26 @@ button { -webkit-user-select: none; user-select: none; }
       setTimeout(() => toast.remove(), 5000);
     }
 
-    function initAudioContext() {
-      if (!AudioContext) {
-        console.error('Web Audio API is not supported in this browser.');
-        showAudioError('Web Audio API is not supported in this browser.');
-        return null;
+    function updateAudioStatus() {
+      const statusEl = document.getElementById('audioStatus');
+      if (!statusEl) return;
+      if (!AudioContextClass) {
+        statusEl.textContent = 'Audio: Not supported';
+        return;
       }
-
-      try {
-        if (!audioCtx) {
-          audioCtx = new AudioContext();
-        }
-        if (audioCtx.state === 'suspended') {
-          audioCtx.resume().catch(error => {
-            console.error('AudioContext resume failed:', error);
-            showAudioError();
-          });
-        }
-        return audioCtx;
-      } catch (error) {
-        console.error('Audio initialization failed:', error);
-        showAudioError();
-        return null;
+      if (!audioCtx) {
+        statusEl.textContent = 'Audio: Not initialized';
+        return;
       }
+      statusEl.textContent = `Audio: ${audioCtx.state === 'running' ? 'Ready (running)' : audioCtx.state}`;
     }
-    
+
+    window.__audioDebug = () => ({
+      supported: !!AudioContextClass,
+      state: audioCtx ? audioCtx.state : "no-context",
+      unlocked: audioCtx ? !!audioCtx.__unlocked : false,
+    });
+
     function getFrequency(noteName) {
       const freqMap = {
         "C": 130.81, "C#": 138.59, "Db": 138.59,
@@ -1248,56 +1291,143 @@ button { -webkit-user-select: none; user-select: none; }
       return freqMap[noteName] || 0;
     }
 
-    function playNote(noteName, duration = 0.3, delay = 0, octave = 0) {
-      try {
-        const context = initAudioContext();
+    function getNoteFrequency(noteName, octave = 0) {
+      const base = getFrequency(noteName);
+      return base ? base * Math.pow(2, octave) : 0;
+    }
+
+    async function beepHz(freq, durationMs = 450, type = "sine", gainVal = 0.12) {
+      const ctx = await ensureAudioContext();
+      if (!ctx) {
+        showAudioError('Web Audio API is not supported in this browser.');
         updateAudioStatus();
+        return;
+      }
+
+      const now = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, now);
+
+      // clickless envelope
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(gainVal, now + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + durationMs / 1000);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start(now);
+      osc.stop(now + durationMs / 1000 + 0.02);
+    }
+
+    async function playIntervalExample(rootHz, intervalHz) {
+      const ctx = await ensureAudioContext();
+      if (!ctx) {
+        showAudioError('Web Audio API is not supported in this browser.');
+        updateAudioStatus();
+        return;
+      }
+      await beepHz(rootHz, 500);
+      await new Promise(r => setTimeout(r, 120));
+      await beepHz(intervalHz, 500);
+    }
+
+    async function playTwoNotesTogether(aHz, bHz, durationMs = 650) {
+      const ctx = await ensureAudioContext();
+      if (!ctx) {
+        showAudioError('Web Audio API is not supported in this browser.');
+        updateAudioStatus();
+        return;
+      }
+
+      const now = ctx.currentTime;
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.12, now + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + durationMs/1000);
+      gain.connect(ctx.destination);
+
+      const oscA = ctx.createOscillator();
+      oscA.type = "sine";
+      oscA.frequency.setValueAtTime(aHz, now);
+      oscA.connect(gain);
+
+      const oscB = ctx.createOscillator();
+      oscB.type = "sine";
+      oscB.frequency.setValueAtTime(bHz, now);
+      oscB.connect(gain);
+
+      oscA.start(now); oscB.start(now);
+      oscA.stop(now + durationMs/1000 + 0.02);
+      oscB.stop(now + durationMs/1000 + 0.02);
+    }
+
+    async function playNote(noteName, duration = 0.3, delay = 0, octave = 0) {
+      try {
+        const context = await ensureAudioContext();
         if (!context) {
-          showAudioError();
+          showAudioError('Web Audio API is not supported in this browser.');
+          updateAudioStatus();
           return;
         }
-        let freq = getFrequency(noteName);
+        const freq = getNoteFrequency(noteName, octave);
         if (freq === 0) return;
-        freq = freq * Math.pow(2, octave);
 
+        const startTime = context.currentTime + delay;
         const osc = context.createOscillator();
         const gain = context.createGain();
 
-        osc.frequency.setValueAtTime(freq, context.currentTime + delay);
+        osc.frequency.setValueAtTime(freq, startTime);
         osc.type = "sine";
-        
-        gain.gain.setValueAtTime(0, context.currentTime + delay);
-        gain.gain.linearRampToValueAtTime(0.25, context.currentTime + delay + 0.05);
-        gain.gain.linearRampToValueAtTime(0.15, context.currentTime + delay + 0.15);
-        gain.gain.linearRampToValueAtTime(0, context.currentTime + delay + duration);
+
+        gain.gain.setValueAtTime(0, startTime);
+        gain.gain.linearRampToValueAtTime(0.25, startTime + 0.05);
+        gain.gain.linearRampToValueAtTime(0.15, startTime + 0.15);
+        gain.gain.linearRampToValueAtTime(0, startTime + duration);
 
         osc.connect(gain).connect(context.destination);
-        osc.start(context.currentTime + delay);
-        osc.stop(context.currentTime + delay + duration);
+        osc.start(startTime);
+        osc.stop(startTime + duration);
       } catch (error) {
         console.error("Error playing note:", error);
         showAudioError();
       }
     }
-    
-    function playScale(scaleNotes) {
+
+    async function playScale(scaleNotes) {
+      const ctx = await ensureAudioContext();
+      if (!ctx) {
+        showAudioError('Web Audio API is not supported in this browser.');
+        updateAudioStatus();
+        return;
+      }
       let delay = 0;
-      scaleNotes.forEach(note => {
-        playNote(note, 0.25, delay, 1);
+      for (const note of scaleNotes) {
+        await playNote(note, 0.25, delay, 1);
         delay += 0.3;
-      });
-      playNote(scaleNotes[0], 0.3, delay, 2);
+      }
+      await playNote(scaleNotes[0], 0.3, delay, 2);
     }
 
-    function playChord(noteEntries) {
-      noteEntries.forEach(entry => {
+    async function playChord(noteEntries) {
+      const ctx = await ensureAudioContext();
+      if (!ctx) {
+        showAudioError('Web Audio API is not supported in this browser.');
+        updateAudioStatus();
+        return;
+      }
+      await Promise.all(noteEntries.map(entry => {
         const noteName = typeof entry === 'string' ? entry : entry.note;
         const octave = typeof entry === 'object' && entry !== null && 'octave' in entry
           ? entry.octave
           : 0;
-        if (!noteName) return;
-        playNote(noteName, 0.8, 0, octave);
-      });
+        if (!noteName) return null;
+        return playNote(noteName, 0.8, 0, octave);
+      }));
     }
 
     // ============================================================================
@@ -1494,9 +1624,8 @@ button { -webkit-user-select: none; user-select: none; }
             });
 
             const octave = STRING_OCTAVE_OFFSETS[s] ?? 0;
-            circle.addEventListener('click', () => {
-              initAudioContext();
-              playNote(noteName, 0.5, 0, octave);
+            circle.addEventListener('click', async () => {
+              await playNote(noteName, 0.5, 0, octave);
             });
 
             const noteIdx = scaleData.notes.indexOf(noteName);
@@ -2002,7 +2131,7 @@ button { -webkit-user-select: none; user-select: none; }
     // PRACTICE GENERATORS
     // ============================================================================
     
-    function generateMelodicPattern() {
+    async function generateMelodicPattern() {
       const scaleName = document.getElementById("scaleSelect").value;
       const root = document.getElementById("rootSelect").value;
       if (!root || !scaleName) {
@@ -2033,10 +2162,10 @@ button { -webkit-user-select: none; user-select: none; }
 
       // Play the pattern
       let delay = 0;
-      selected.pattern.forEach(note => {
-        playNote(note, 0.2, delay, 1);
+      for (const note of selected.pattern) {
+        await playNote(note, 0.2, delay, 1);
         delay += 0.25;
-      });
+      }
     }
 
     function generateIntervalSequence() {
@@ -2111,7 +2240,7 @@ button { -webkit-user-select: none; user-select: none; }
       `);
     }
 
-    function generateSequenceChallenge() {
+    async function generateSequenceChallenge() {
       const scaleName = document.getElementById("scaleSelect").value;
       const root = document.getElementById("rootSelect").value;
       if (!root || !scaleName) {
@@ -2141,10 +2270,10 @@ button { -webkit-user-select: none; user-select: none; }
 
       // Play the sequence
       let delay = 0;
-      selected.notes.forEach(note => {
-        playNote(note, 0.2, delay, 1);
+      for (const note of selected.notes) {
+        await playNote(note, 0.2, delay, 1);
         delay += 0.25;
-      });
+      }
     }
 
     function showPracticeOutput(html) {
@@ -2162,7 +2291,7 @@ button { -webkit-user-select: none; user-select: none; }
       isAnswered: false
     };
 
-    function startQuiz() {
+    async function startQuiz() {
       const scaleName = document.getElementById("scaleSelect").value;
       const root = document.getElementById("rootSelect").value;
       if (!root || !scaleName) {
@@ -2173,11 +2302,11 @@ button { -webkit-user-select: none; user-select: none; }
       quizState.score = 0;
       quizState.total = 0;
       document.getElementById("quizFeedback").classList.add("hidden");
-      
-      nextQuestion();
+
+      await nextQuestion();
     }
 
-    function nextQuestion() {
+    async function nextQuestion() {
       const scaleName = document.getElementById("scaleSelect").value;
       const root = document.getElementById("rootSelect").value;
       const scaleData = buildScaleFromDB(root, scaleName);
@@ -2212,8 +2341,12 @@ button { -webkit-user-select: none; user-select: none; }
       document.getElementById("nextQuestionBtn").classList.add("hidden");
       document.getElementById("quizFeedback").classList.add("hidden");
 
-      // Play the note
-      playNote(targetNote, 0.5, 0, 1);
+      // Play the interval (root then target) for clearer context
+      const rootHz = getNoteFrequency(root, 1);
+      const targetHz = getNoteFrequency(targetNote, 1);
+      if (rootHz && targetHz) {
+        await playIntervalExample(rootHz, targetHz);
+      }
     }
 
     function checkAnswer(selected) {
@@ -2437,6 +2570,8 @@ button { -webkit-user-select: none; user-select: none; }
     // ============================================================================
     
     document.addEventListener('DOMContentLoaded', () => {
+      updateAudioStatus();
+
       // Populate dropdowns
       const familySelect = document.getElementById("familySelect");
       const scaleSelect = document.getElementById("scaleSelect");
@@ -2499,40 +2634,45 @@ button { -webkit-user-select: none; user-select: none; }
       document.getElementById("showScaleBtn").addEventListener("click", updateScale);
       document.getElementById("clearHighlightsBtn").addEventListener("click", FretboardRenderer.clearHighlights);
 
-      document.getElementById("playScaleBtn").addEventListener("click", () => {
+      document.getElementById("playScaleBtn").addEventListener("click", async () => {
         const scaleName = scaleSelect.value;
         const root = rootSelect.value;
         if (!root || !scaleName) return;
-        
-        initAudioContext();
+
+        const ctx = await ensureAudioContext();
+        updateAudioStatus();
+        if (!ctx) {
+          showAudioError('Web Audio API is not supported in this browser.');
+          return;
+        }
         const scaleData = buildScaleFromDB(root, scaleName);
-        playScale(scaleData.scaleNotes);
+        await playScale(scaleData.scaleNotes);
       });
 
-      
+
       const audioTestBtn = document.getElementById("audioTestBtn");
       if (audioTestBtn) {
-        audioTestBtn.addEventListener("click", () => {
-          const ctx = initAudioContext();
+        audioTestBtn.addEventListener("click", async () => {
+          const ctx = await ensureAudioContext();
           updateAudioStatus();
-          if (!ctx) return;
-          // Quick A440 ping
+          if (!ctx) {
+            showAudioError('Web Audio API is not supported in this browser.');
+            return;
+          }
           try {
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            osc.type = "sine";
-            osc.frequency.value = 440;
-            gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-            gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01);
-            gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
-            osc.connect(gain);
-            gain.connect(ctx.destination);
-            osc.start();
-            osc.stop(ctx.currentTime + 0.4);
+            await beepHz(440, 400);
           } catch (e) {
             console.error("Audio test failed:", e);
             showAudioError("Audio test failed. Check Silent Mode / volume, then tap again.");
           }
+        });
+      }
+
+      const enableAudioBtn = document.getElementById("enableAudioBtn");
+      if (enableAudioBtn) {
+        enableAudioBtn.addEventListener("click", async () => {
+          await ensureAudioContext();
+          updateAudioStatus();
         });
       }
 
@@ -2584,12 +2724,14 @@ document.getElementById("randomScaleBtn").addEventListener("click", () => {
       document.getElementById("generateBalladBtn").addEventListener("click", generateJazzBallad);
 
       // Quiz system
-      document.getElementById("startQuizBtn").addEventListener("click", () => {
-        startQuiz();
+      document.getElementById("startQuizBtn").addEventListener("click", async () => {
+        await startQuiz();
         logActivity("Started interval quiz");
       });
-      
-      document.getElementById("nextQuestionBtn").addEventListener("click", nextQuestion);
+
+      document.getElementById("nextQuestionBtn").addEventListener("click", async () => {
+        await nextQuestion();
+      });
 
       // Stats
       document.getElementById("resetStatsBtn").addEventListener("click", resetStats);
@@ -4330,11 +4472,9 @@ window.__logGTT('✅ Enhanced test suite loaded');
 
   // Ensure any tap on primary controls attempts to resume audio (iOS)
   function resumeAudioIfNeeded(){
-    try{
-      if (window.audioCtx && window.audioCtx.state === 'suspended') {
-        window.audioCtx.resume().catch(()=>{});
-      }
-    }catch(e){}
+    ensureAudioContext().then(updateAudioStatus).catch(error => {
+      console.error('Audio resume failed:', error);
+    });
   }
   document.addEventListener('pointerup', resumeAudioIfNeeded, {passive:true});
 })();
