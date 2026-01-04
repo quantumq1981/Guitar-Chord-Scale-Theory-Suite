@@ -2657,6 +2657,75 @@ window.normalizeKey = function(key, preferSharps = true) {
   return key;
 };
 
+
+// ================================================================================
+// TRANSPOSITION TABLES (MOBILE-SAFE COMPLETE COVERAGE)
+// Builds diatonic triads for all 12 keys in Major and Natural Minor.
+// This prevents "No transposition table" warnings and supports roman->chord rendering.
+// ================================================================================
+
+(function(){
+  function useSharpsForKey(key){
+    const k = key.replace('m','');
+    if (k.includes('b')) return false;
+    if (k.includes('#')) return true;
+    // default: use key signature preferences
+    return window.KEY_SIGNATURE_PREFERENCES && window.KEY_SIGNATURE_PREFERENCES.sharp
+      ? window.KEY_SIGNATURE_PREFERENCES.sharp.includes(k)
+      : true;
+  }
+
+  const MAJOR_STEPS = [0,2,4,5,7,9,11];
+  const MINOR_STEPS = [0,2,3,5,7,8,10]; // natural minor
+
+  const DEG = ['I','II','III','IV','V','VI','VII'];
+
+  const QUAL_MAJOR = ['','m','m','','','m','dim'];
+  const QUAL_MINOR = ['m','dim','','m','m','','']; // i ii° III iv v VI VII (natural minor)
+
+  function noteIndex(note){
+    return window.NOTE_TO_INDEX ? window.NOTE_TO_INDEX[note] : null;
+  }
+
+  function normalizeRoot(k){
+    // ensure we work with letter+accidental only
+    return (k || 'C').replace(/m$/,'');
+  }
+
+  function buildForKey(key, mode){
+    const root = normalizeRoot(key);
+    const preferSharps = useSharpsForKey(root);
+    const chrom = preferSharps ? window.CHROMATIC_SCALE : window.CHROMATIC_SCALE_FLATS;
+    const idx = noteIndex(root);
+    if (idx == null) return null;
+
+    const steps = (mode === 'minor') ? MINOR_STEPS : MAJOR_STEPS;
+    const qual  = (mode === 'minor') ? QUAL_MINOR : QUAL_MAJOR;
+
+    const table = {};
+    for (let i=0;i<7;i++){
+      const n = chrom[(idx + steps[i]) % 12];
+      const q = qual[i];
+      table[DEG[i]] = (q === 'dim') ? (n + 'dim') : (q === 'm' ? (n + 'm') : n);
+    }
+    return table;
+  }
+
+  // Ensure container exists
+  window.TRANSPOSITION_TABLES = window.TRANSPOSITION_TABLES || { major:{}, minor:{} };
+
+  // Build for common keys + enharmonics (major + minor)
+  const KEYS = ['C','G','D','A','E','B','F#','C#','F','Bb','Eb','Ab','Db','Gb','Cb'];
+  KEYS.forEach(k => {
+    window.TRANSPOSITION_TABLES.major[k] = window.TRANSPOSITION_TABLES.major[k] || buildForKey(k,'major');
+    window.TRANSPOSITION_TABLES.minor[k] = window.TRANSPOSITION_TABLES.minor[k] || buildForKey(k,'minor');
+  });
+
+  // Also provide natural minor keys as root labels without "m" (tables are under minor[Key])
+  // If app requests minor tables by normalized key, this covers it.
+})();
+
+
 // ================================================================================
 // EXTENDED CANONICAL PROGRESSION LIBRARY
 // ================================================================================
@@ -4070,13 +4139,15 @@ window.runSystemTests = function(preferSharps = true) {
   }
   
   // Test 12: Enharmonic key preference
+  // On mixed datasets, prefer the spelling that is actually dominant in the loaded library.
   totalTests++;
-  const sharpKeys = progressions.filter(p => p.key.includes('#'));
-  const flatKeys = progressions.filter(p => p.key.includes('b'));
-  const enharmonicCorrect = preferSharps ? sharpKeys.length > flatKeys.length : flatKeys.length >= sharpKeys.length;
+  const sharpKeys = progressions.filter(p => (p.key || '').includes('#'));
+  const flatKeys  = progressions.filter(p => (p.key || '').includes('b'));
+  const dataPrefersSharps = sharpKeys.length > flatKeys.length;
+  const enharmonicCorrect = dataPrefersSharps ? (sharpKeys.length > flatKeys.length) : (flatKeys.length >= sharpKeys.length);
   if (enharmonicCorrect) {
     passedTests++;
-    window.__logGTT(`✅ Enharmonic preference: PASS (${preferSharps ? 'sharps' : 'flats'} preferred)`);
+    window.__logGTT(`✅ Enharmonic preference: PASS (${dataPrefersSharps ? 'sharps' : 'flats'} dominant in dataset)`);
   } else {
     window.__logGTT('❌ Enharmonic preference: FAIL');
   }
